@@ -17,6 +17,15 @@ def normalizar_texto(texto):
     return " ".join(texto.split())
 
 
+def normalizar_monto_texto(texto):
+    """
+    Normaliza texto para comparar montos:
+    - quita espacios
+    - quita comas
+    """
+    return texto.replace(" ", "").replace(",", "").strip()
+
+
 def convertir_monto(texto):
     try:
         return float(texto.replace(",", "").strip())
@@ -88,6 +97,7 @@ def linea_es_abono(texto):
 
 def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
     resultados = []
+    monto_normalizado = normalizar_monto_texto(monto_busqueda)
 
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -103,13 +113,16 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
         if not texto_pagina:
             continue
 
-        if monto_busqueda not in texto_pagina:
+        texto_pagina_normalizado = normalizar_monto_texto(texto_pagina)
+        if monto_normalizado not in texto_pagina_normalizado:
             continue
 
         lineas = texto_pagina.split("\n")
 
         for i, linea in enumerate(lineas):
-            if monto_busqueda not in linea:
+            linea_normalizada = normalizar_monto_texto(linea)
+
+            if monto_normalizado not in linea_normalizada:
                 continue
 
             # Revisar contexto: anterior + actual + siguiente
@@ -192,9 +205,12 @@ def generar_recorte_monto(pdf_bytes, numero_pagina, monto_busqueda, zoom=3.0):
 
         lineas = sorted(lineas, key=lambda l: l["y0"])
 
+        monto_normalizado = normalizar_monto_texto(monto_busqueda)
+
         indice_base = None
         for i, linea in enumerate(lineas):
-            if monto_busqueda in linea["texto"]:
+            texto_normalizado = normalizar_monto_texto(linea["texto"])
+            if monto_normalizado in texto_normalizado:
                 indice_base = i
                 break
 
@@ -296,8 +312,7 @@ def extraer_movimientos_candidatos(pdf_bytes, nombre_archivo, objetivo):
             if not montos:
                 continue
 
-            # Para reducir ruido:
-            # tomar solo el último monto útil de la línea
+            # Tomar solo el último monto útil de la línea
             monto = montos[-1]
 
             if monto <= 0 or monto > objetivo:
@@ -349,10 +364,8 @@ def buscar_opciones_sumatoria_misma_fecha(movimientos, objetivo_centavos, max_op
     opciones = []
 
     for fecha, lista in grupos.items():
-        # ordenar de mayor a menor ayuda a encontrar opciones compactas
         lista = sorted(lista, key=lambda x: x["centavos"], reverse=True)
 
-        # DP: suma -> lista de índices
         dp = {0: []}
 
         for idx, mov in enumerate(lista):
@@ -391,7 +404,6 @@ def buscar_opciones_sumatoria_misma_fecha(movimientos, objetivo_centavos, max_op
 
 
 def ordenar_opciones(opciones):
-    # priorizar menos movimientos y luego archivo/fecha
     return sorted(
         opciones,
         key=lambda x: (
@@ -479,7 +491,6 @@ def mostrar_detalle_opcion(opcion, archivos_bytes):
         )
 
         if not recorte:
-            # intentar sin comas
             recorte = generar_recorte_monto(
                 archivos_bytes[mov["archivo"]],
                 mov["pagina"],
@@ -537,13 +548,11 @@ if st.button("Buscar"):
                 )
                 resultados_exactos.extend(resultados)
 
-        # 1) Exacto primero
         exactos_validos = [r for r in resultados_exactos if "error" not in r]
 
         if exactos_validos:
             mostrar_resultados_exactos(exactos_validos, archivos_bytes, monto_busqueda.strip())
         else:
-            # 2) Si no hay exacto, buscar sumatorias de una sola fecha
             st.info("No se encontró monto exacto. Buscando opciones de sumatoria por un solo día...")
 
             todos_los_movimientos = []
