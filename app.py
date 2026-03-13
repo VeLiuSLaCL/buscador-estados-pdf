@@ -1,4 +1,3 @@
-import re
 import fitz
 import streamlit as st
 
@@ -9,13 +8,6 @@ st.title("Buscador de montos en estados de cuenta")
 
 def normalizar_texto(texto):
     return " ".join(texto.split())
-
-
-def extraer_fecha(linea):
-    m = re.search(r"\b\d{2}-[A-Z]{3}-\d{4}\b", linea.upper())
-    if m:
-        return m.group(0)
-    return None
 
 
 def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
@@ -41,22 +33,10 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
         lineas = texto_pagina.split("\n")
 
         for linea in lineas:
-            texto_linea = linea.upper()
-
-            # Solo considerar líneas con fecha
-            fecha = extraer_fecha(linea)
-            if not fecha:
-                continue
-
-            # Ignorar líneas con ABO o ABONO
-            if "ABO" in texto_linea or "ABONO" in texto_linea:
-                continue
-
             if monto_busqueda in linea:
                 resultados.append({
                     "archivo": nombre_archivo,
                     "pagina": num_pagina,
-                    "fecha": fecha,
                     "linea": normalizar_texto(linea)
                 })
 
@@ -154,7 +134,6 @@ if st.button("Buscar"):
                     st.markdown(f"### Coincidencia #{i}")
                     st.write(f"**Archivo:** {resultado['archivo']}")
                     st.write(f"**Página:** {resultado['pagina']}")
-                    st.write(f"**Fecha:** {resultado['fecha']}")
                     st.write(f"**Línea:** {resultado['linea']}")
 
                     if resultado.get("recorte"):
