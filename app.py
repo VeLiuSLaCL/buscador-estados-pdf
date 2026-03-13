@@ -1,3 +1,4 @@
+import re
 import fitz
 import streamlit as st
 
@@ -8,6 +9,14 @@ st.title("Buscador de montos en estados de cuenta")
 
 def normalizar_texto(texto):
     return " ".join(texto.split())
+
+
+def linea_es_abono(linea):
+    """
+    Devuelve True si la línea contiene ABO o ABONO como palabra.
+    """
+    texto = linea.upper()
+    return re.search(r"\bABO(?:NO)?\b", texto) is not None
 
 
 def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
@@ -33,12 +42,18 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
         lineas = texto_pagina.split("\n")
 
         for linea in lineas:
-            if monto_busqueda in linea:
-                resultados.append({
-                    "archivo": nombre_archivo,
-                    "pagina": num_pagina,
-                    "linea": normalizar_texto(linea)
-                })
+            if monto_busqueda not in linea:
+                continue
+
+            # Excluir líneas con ABO o ABONO
+            if linea_es_abono(linea):
+                continue
+
+            resultados.append({
+                "archivo": nombre_archivo,
+                "pagina": num_pagina,
+                "linea": normalizar_texto(linea)
+            })
 
     return resultados
 
@@ -58,7 +73,6 @@ def generar_recorte_monto(pdf_bytes, numero_pagina, monto_busqueda, zoom=3.0):
 
         rect = coincidencias[0]
 
-        # Ajustes finos del recorte
         margen_superior = 3
         margen_inferior = 3
         inicio_x = 20
@@ -121,9 +135,9 @@ if st.button("Buscar"):
                 resultados_totales.extend(resultados)
 
         if not resultados_totales:
-            st.error("No se encontró el monto en ninguno de los archivos.")
+            st.error("No se encontró el monto en ninguno de los archivos con líneas válidas.")
         else:
-            st.success(f"Se encontraron {len(resultados_totales)} coincidencia(s).")
+            st.success(f"Se encontraron {len(resultados_totales)} coincidencia(s) válidas.")
 
             for i, resultado in enumerate(resultados_totales, start=1):
                 if "error" in resultado:
