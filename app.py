@@ -11,8 +11,14 @@ def normalizar_texto(texto):
     return " ".join(texto.split())
 
 
-def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
+def extraer_fecha(linea):
+    m = re.search(r"\b\d{2}-[A-Z]{3}-\d{4}\b", linea.upper())
+    if m:
+        return m.group(0)
+    return None
 
+
+def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
     resultados = []
 
     try:
@@ -21,9 +27,11 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
         return [{"archivo": nombre_archivo, "error": f"No se pudo abrir el PDF: {e}"}]
 
     for num_pagina, pagina in enumerate(doc, start=1):
+        # Omitir página 1 (resumen)
+        if num_pagina == 1:
+            continue
 
         texto_pagina = pagina.get_text("text")
-
         if not texto_pagina:
             continue
 
@@ -33,12 +41,22 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
         lineas = texto_pagina.split("\n")
 
         for linea in lineas:
+            texto_linea = linea.upper()
+
+            # Solo considerar líneas con fecha
+            fecha = extraer_fecha(linea)
+            if not fecha:
+                continue
+
+            # Ignorar líneas con ABO o ABONO
+            if "ABO" in texto_linea or "ABONO" in texto_linea:
+                continue
 
             if monto_busqueda in linea:
-
                 resultados.append({
                     "archivo": nombre_archivo,
                     "pagina": num_pagina,
+                    "fecha": fecha,
                     "linea": normalizar_texto(linea)
                 })
 
@@ -47,27 +65,23 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
 
 def generar_recorte_monto(pdf_bytes, numero_pagina, monto_busqueda, zoom=3.0):
     """
-    Genera un recorte horizontal tipo renglón:
-    desde el inicio de la hoja hasta un poco después del monto.
+    Genera un recorte horizontal tipo renglón,
+    quitando margen izquierdo y ajustando arriba/abajo.
     """
-
     try:
-
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         pagina = doc[numero_pagina - 1]
 
         coincidencias = pagina.search_for(monto_busqueda)
-
         if not coincidencias:
             return None
 
         rect = coincidencias[0]
 
-        # Ajustes del recorte
-        margen_superior = 4
-        margen_inferior = 4
-
-        inicio_x = 15
+        # Ajustes finos del recorte
+        margen_superior = 3
+        margen_inferior = 3
+        inicio_x = 20
         fin_x = min(pagina.rect.width, rect.x1 + 40)
 
         clip = fitz.Rect(
@@ -78,7 +92,6 @@ def generar_recorte_monto(pdf_bytes, numero_pagina, monto_busqueda, zoom=3.0):
         )
 
         matriz = fitz.Matrix(zoom, zoom)
-
         pix = pagina.get_pixmap(matrix=matriz, clip=clip, alpha=False)
 
         return pix.tobytes("png")
@@ -93,29 +106,21 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-
 monto_busqueda = st.text_input(
     "Monto a buscar",
     placeholder="Ejemplo: 18808.16"
 )
 
-
 if st.button("Buscar"):
-
     if not uploaded_files:
         st.warning("Sube al menos un PDF.")
-
     elif not monto_busqueda.strip():
         st.warning("Escribe un monto.")
-
     else:
-
         resultados_totales = []
 
         with st.spinner("Buscando en los archivos..."):
-
             for archivo in uploaded_files:
-
                 pdf_bytes = archivo.read()
 
                 resultados = buscar_lineas_con_monto(
@@ -125,43 +130,34 @@ if st.button("Buscar"):
                 )
 
                 for r in resultados:
-
                     if "error" not in r:
-
                         recorte = generar_recorte_monto(
                             pdf_bytes,
                             r["pagina"],
                             monto_busqueda.strip()
                         )
-
                         r["recorte"] = recorte
 
                 resultados_totales.extend(resultados)
 
         if not resultados_totales:
-
             st.error("No se encontró el monto en ninguno de los archivos.")
-
         else:
-
             st.success(f"Se encontraron {len(resultados_totales)} coincidencia(s).")
 
             for i, resultado in enumerate(resultados_totales, start=1):
-
                 if "error" in resultado:
                     st.error(f"{resultado['archivo']}: {resultado['error']}")
                     continue
 
                 with st.container():
-
                     st.markdown(f"### Coincidencia #{i}")
-
                     st.write(f"**Archivo:** {resultado['archivo']}")
                     st.write(f"**Página:** {resultado['pagina']}")
+                    st.write(f"**Fecha:** {resultado['fecha']}")
                     st.write(f"**Línea:** {resultado['linea']}")
 
                     if resultado.get("recorte"):
-
                         st.image(
                             resultado["recorte"],
                             caption=f"Recorte visual de {resultado['archivo']} - página {resultado['pagina']}",
