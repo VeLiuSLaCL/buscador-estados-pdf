@@ -11,12 +11,24 @@ def normalizar_texto(texto):
     return " ".join(texto.split())
 
 
-def linea_es_abono(linea):
+def linea_es_abono(texto):
     """
-    Devuelve True si la línea contiene ABO o ABONO como palabra.
+    Devuelve True si el texto contiene ABO o ABONO como palabra,
+    tolerando espacios raros del OCR.
     """
-    texto = linea.upper()
-    return re.search(r"\bABO(?:NO)?\b", texto) is not None
+    texto = texto.upper()
+
+    # Normalizar espacios repetidos
+    texto = " ".join(texto.split())
+
+    patrones = [
+        r"\bABO\b",
+        r"\bABONO\b",
+        r"\bA\s*B\s*O\b",
+        r"\bA\s*B\s*O\s*N\s*O\b",
+    ]
+
+    return any(re.search(patron, texto) for patron in patrones)
 
 
 def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
@@ -41,12 +53,25 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
 
         lineas = texto_pagina.split("\n")
 
-        for linea in lineas:
+        for i, linea in enumerate(lineas):
             if monto_busqueda not in linea:
                 continue
 
-            # Excluir líneas con ABO o ABONO
-            if linea_es_abono(linea):
+            # Revisar contexto: línea anterior + actual + siguiente
+            contexto = []
+
+            if i > 0:
+                contexto.append(lineas[i - 1])
+
+            contexto.append(linea)
+
+            if i + 1 < len(lineas):
+                contexto.append(lineas[i + 1])
+
+            texto_contexto = " ".join(contexto)
+
+            # Excluir si en el contexto aparece ABO o ABONO
+            if linea_es_abono(texto_contexto):
                 continue
 
             resultados.append({
