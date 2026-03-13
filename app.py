@@ -17,8 +17,6 @@ def linea_es_abono(texto):
     tolerando espacios raros del OCR.
     """
     texto = texto.upper()
-
-    # Normalizar espacios repetidos
     texto = " ".join(texto.split())
 
     patrones = [
@@ -85,30 +83,110 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
 
 def generar_recorte_monto(pdf_bytes, numero_pagina, monto_busqueda, zoom=3.0):
     """
-    Genera un recorte horizontal tipo renglón,
-    quitando margen izquierdo y ajustando arriba/abajo.
+    Genera un recorte dinámico del movimiento completo:
+    - empieza en la línea donde está el monto
+    - incluye líneas siguientes relacionadas
+    - se detiene al detectar un nuevo movimiento o un salto vertical grande
     """
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         pagina = doc[numero_pagina - 1]
 
-        coincidencias = pagina.search_for(monto_busqueda)
-        if not coincidencias:
+        palabras = pagina.get_text("words")
+        if not palabras:
             return None
 
-        rect = coincidencias[0]
+        # words: (x0, y0, x1, y1, "texto", block_no, line_no, word_no)
+        palabras = sorted(palabras, key=lambda w: (round(w[1], 1), w[0]))
 
-        margen_superior = 3
-        margen_inferior = 3
+        # Agrupar palabras por línea usando tolerancia vertical
+        lineas = []
+        tolerancia_y = 3
+
+        for w in palabras:
+            x0, y0, x1, y1, txt = w[:5]
+
+            asignada = False
+            for linea in lineas:
+                if abs(linea["y0"] - y0) <= tolerancia_y:
+                    linea["words"].append(w)
+                    linea["y0"] = min(linea["y0"], y0)
+                    linea["y1"] = max(linea["y1"], y1)
+                    asignada = True
+                    break
+
+            if not asignada:
+                lineas.append({
+                    "y0": y0,
+                    "y1": y1,
+                    "words": [w]
+                })
+
+        # Ordenar palabras dentro de cada línea y construir texto
+        for linea in lineas:
+            linea["words"] = sorted(linea["words"], key=lambda w: w[0])
+            linea["texto"] = " ".join(w[4] for w in linea["words"])
+            linea["x0"] = min(w[0] for w in linea["words"])
+            linea["x1"] = max(w[2] for w in linea["words"])
+
+        lineas = sorted(lineas, key=lambda l: l["y0"])
+
+        # Encontrar la línea que contiene el monto
+        indice_base = None
+        for i, linea in enumerate(lineas):
+            if monto_busqueda in linea["texto"]:
+                indice_base = i
+                break
+
+        if indice_base is None:
+            # Fallback visual clásico
+            coincidencias = pagina.search_for(monto_busqueda)
+            if not coincidencias:
+                return None
+
+            rect = coincidencias[0]
+            clip = fitz.Rect(
+                20,
+                max(0, rect.y0 - 3),
+                min(pagina.rect.width, rect.x1 + 40),
+                min(pagina.rect.height, rect.y1 + 3),
+            )
+            matriz = fitz.Matrix(zoom, zoom)
+            pix = pagina.get_pixmap(matrix=matriz, clip=clip, alpha=False)
+            return pix.tobytes("png")
+
+        linea_base = lineas[indice_base]
+
+        # Parámetros de recorte
         inicio_x = 20
-        fin_x = min(pagina.rect.width, rect.x1 + 40)
+        fin_x = min(pagina.rect.width, linea_base["x1"] + 120)
 
-        clip = fitz.Rect(
-            inicio_x,
-            max(0, rect.y0 - margen_superior),
-            fin_x,
-            min(pagina.rect.height, rect.y1 + margen_inferior),
-        )
+        y_inicio = max(0, linea_base["y0"] - 3)
+        y_fin = min(pagina.rect.height, linea_base["y1"] + 3)
+
+        patron_fecha = re.compile(r"^\d{2}-[A-Z]{3}-\d{4}\b", re.IGNORECASE)
+
+        # Extender hacia abajo mientras siga siendo parte del mismo movimiento
+        for j in range(indice_base + 1, len(lineas)):
+            actual = lineas[j]
+            anterior = lineas[j - 1]
+
+            texto_actual = actual["texto"].strip()
+            gap_vertical = actual["y0"] - anterior["y1"]
+
+            # Si empieza un nuevo movimiento con fecha, detener
+            if patron_fecha.search(texto_actual):
+                break
+
+            # Si hay mucho espacio vertical en blanco, detener
+            if gap_vertical > 10:
+                break
+
+            # Si sigue siendo parte del bloque descriptivo, incluir
+            y_fin = min(pagina.rect.height, actual["y1"] + 3)
+            fin_x = max(fin_x, min(pagina.rect.width, actual["x1"] + 40))
+
+        clip = fitz.Rect(inicio_x, y_inicio, fin_x, y_fin)
 
         matriz = fitz.Matrix(zoom, zoom)
         pix = pagina.get_pixmap(matrix=matriz, clip=clip, alpha=False)
