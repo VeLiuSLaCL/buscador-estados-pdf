@@ -64,11 +64,10 @@ def generar_recorte_monto(pdf_bytes, numero_pagina, monto_busqueda, zoom=3.0):
         rect = coincidencias[0]
 
         # Ajustes del recorte
-        margen_superior = 6
-        margen_inferior = 6
-
-        inicio_x = 0
-        fin_x = min(pagina.rect.width, rect.x1 + 40)
+margen_superior = 3
+margen_inferior = 3
+inicio_x = 20
+fin_x = min(pagina.rect.width, rect.x1 + 40)
 
         clip = fitz.Rect(
             inicio_x,
