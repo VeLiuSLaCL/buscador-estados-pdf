@@ -9,20 +9,15 @@ st.set_page_config(page_title="Buscador de montos", layout="wide")
 st.title("Buscador de montos en estados de cuenta")
 
 
-# ---------------------------
+# =========================================================
 # Utilidades base
-# ---------------------------
+# =========================================================
 
 def normalizar_texto(texto):
     return " ".join(texto.split())
 
 
 def normalizar_monto_texto(texto):
-    """
-    Normaliza texto para comparar montos:
-    - quita espacios
-    - quita comas
-    """
     return texto.replace(" ", "").replace(",", "").strip()
 
 
@@ -51,33 +46,7 @@ def extraer_folio(linea):
     return "Sin folio visible"
 
 
-def extraer_montos_de_linea(linea):
-    patrones = [
-        r"\b\d{1,3}(?:,\d{3})*\.\d{2}\b",
-        r"\b\d+\.\d{2}\b"
-    ]
-
-    encontrados = []
-    for patron in patrones:
-        encontrados.extend(re.findall(patron, linea))
-
-    montos = []
-    vistos = set()
-
-    for texto in encontrados:
-        monto = convertir_monto(texto)
-        if monto is not None and monto not in vistos:
-            montos.append(monto)
-            vistos.add(monto)
-
-    return montos
-
-
 def linea_es_abono(texto):
-    """
-    True si el texto contiene ABO o ABONO como palabra,
-    tolerando espacios raros del OCR.
-    """
     texto = texto.upper()
     texto = " ".join(texto.split())
 
@@ -91,9 +60,147 @@ def linea_es_abono(texto):
     return any(re.search(patron, texto) for patron in patrones)
 
 
-# ---------------------------
+def es_token_monto(texto):
+    texto = texto.strip()
+    return re.fullmatch(r"\d{1,3}(?:,\d{3})*\.\d{2}", texto) is not None or \
+           re.fullmatch(r"\d+\.\d{2}", texto) is not None
+
+
+# =========================================================
+# Agrupar palabras por línea
+# =========================================================
+
+def obtener_lineas_desde_pagina(pagina, tolerancia_y=3):
+    palabras = pagina.get_text("words")
+    if not palabras:
+        return []
+
+    palabras = sorted(palabras, key=lambda w: (round(w[1], 1), w[0]))
+
+    lineas = []
+
+    for w in palabras:
+        x0, y0, x1, y1, txt = w[:5]
+
+        asignada = False
+        for linea in lineas:
+            if abs(linea["y0"] - y0) <= tolerancia_y:
+                linea["words"].append(w)
+                linea["y0"] = min(linea["y0"], y0)
+                linea["y1"] = max(linea["y1"], y1)
+                asignada = True
+                break
+
+        if not asignada:
+            lineas.append({
+                "y0": y0,
+                "y1": y1,
+                "words": [w]
+            })
+
+    for linea in lineas:
+        linea["words"] = sorted(linea["words"], key=lambda w: w[0])
+        linea["texto"] = " ".join(w[4] for w in linea["words"])
+        linea["x0"] = min(w[0] for w in linea["words"])
+        linea["x1"] = max(w[2] for w in linea["words"])
+
+    return sorted(lineas, key=lambda l: l["y0"])
+
+
+# =========================================================
+# Detección de columnas
+# =========================================================
+
+def detectar_columnas(pagina, columnas_previas=None):
+    """
+    Intenta detectar las posiciones X de DEPOSITO / RETIRO / SALDO.
+    Devuelve un diccionario con límites para la columna RETIRO.
+    Si no encuentra encabezados en la página, usa las columnas previas.
+    """
+    palabras = pagina.get_text("words")
+    if not palabras:
+        return columnas_previas
+
+    headers = {
+        "deposito": None,
+        "retiro": None,
+        "saldo": None
+    }
+
+    for w in palabras:
+        x0, y0, x1, y1, txt = w[:5]
+        t = txt.upper()
+
+        if headers["deposito"] is None and t in ("DEPOSITO", "DEPÓSITO"):
+            headers["deposito"] = (x0, x1)
+        elif headers["retiro"] is None and t == "RETIRO":
+            headers["retiro"] = (x0, x1)
+        elif headers["saldo"] is None and t == "SALDO":
+            headers["saldo"] = (x0, x1)
+
+    if headers["retiro"] is None:
+        return columnas_previas
+
+    retiro_x0, retiro_x1 = headers["retiro"]
+
+    # límites de la columna RETIRO usando puntos medios
+    if headers["deposito"] is not None:
+        dep_x0, dep_x1 = headers["deposito"]
+        limite_izq = (dep_x1 + retiro_x0) / 2
+    else:
+        limite_izq = retiro_x0 - 120
+
+    if headers["saldo"] is not None:
+        sal_x0, sal_x1 = headers["saldo"]
+        limite_der = (retiro_x1 + sal_x0) / 2
+    else:
+        limite_der = retiro_x1 + 120
+
+    return {
+        "retiro_izq": limite_izq,
+        "retiro_der": limite_der,
+        "deposito": headers["deposito"],
+        "retiro": headers["retiro"],
+        "saldo": headers["saldo"],
+    }
+
+
+def extraer_monto_columna_retiro(linea, columnas):
+    """
+    Toma solo el monto que caiga dentro del rango X de la columna RETIRO.
+    """
+    if not columnas:
+        return None
+
+    izq = columnas["retiro_izq"]
+    der = columnas["retiro_der"]
+
+    candidatos = []
+
+    for w in linea["words"]:
+        x0, y0, x1, y1, txt = w[:5]
+
+        if not es_token_monto(txt):
+            continue
+
+        centro_x = (x0 + x1) / 2
+        if izq <= centro_x <= der:
+            monto = convertir_monto(txt)
+            if monto is not None:
+                candidatos.append((x0, monto, txt))
+
+    if not candidatos:
+        return None
+
+    # Si hubiera más de uno, tomar el más a la derecha dentro de RETIRO
+    candidatos.sort(key=lambda x: x[0], reverse=True)
+    _, monto, txt = candidatos[0]
+    return monto, txt
+
+
+# =========================================================
 # Búsqueda exacta
-# ---------------------------
+# =========================================================
 
 def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
     resultados = []
@@ -105,7 +212,6 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
         return [{"archivo": nombre_archivo, "error": f"No se pudo abrir el PDF: {e}"}]
 
     for num_pagina, pagina in enumerate(doc, start=1):
-        # Omitir página 1
         if num_pagina == 1:
             continue
 
@@ -125,20 +231,15 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
             if monto_normalizado not in linea_normalizada:
                 continue
 
-            # Revisar contexto: anterior + actual + siguiente
             contexto = []
-
             if i > 0:
                 contexto.append(lineas[i - 1])
-
             contexto.append(linea)
-
             if i + 1 < len(lineas):
                 contexto.append(lineas[i + 1])
 
             texto_contexto = " ".join(contexto)
 
-            # Excluir si el contexto parece abono
             if linea_es_abono(texto_contexto):
                 continue
 
@@ -154,63 +255,27 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
     return resultados
 
 
-# ---------------------------
+# =========================================================
 # Recorte dinámico
-# ---------------------------
+# =========================================================
 
 def generar_recorte_monto(pdf_bytes, numero_pagina, monto_busqueda, zoom=3.0):
     """
-    Genera un recorte dinámico del movimiento completo:
-    - empieza en la línea donde está el monto
-    - incluye líneas siguientes relacionadas
-    - se detiene al detectar un nuevo movimiento o un salto vertical grande
+    Recorte dinámico del movimiento completo.
     """
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         pagina = doc[numero_pagina - 1]
 
-        palabras = pagina.get_text("words")
-        if not palabras:
+        lineas = obtener_lineas_desde_pagina(pagina)
+        if not lineas:
             return None
-
-        palabras = sorted(palabras, key=lambda w: (round(w[1], 1), w[0]))
-
-        lineas = []
-        tolerancia_y = 3
-
-        for w in palabras:
-            x0, y0, x1, y1, txt = w[:5]
-
-            asignada = False
-            for linea in lineas:
-                if abs(linea["y0"] - y0) <= tolerancia_y:
-                    linea["words"].append(w)
-                    linea["y0"] = min(linea["y0"], y0)
-                    linea["y1"] = max(linea["y1"], y1)
-                    asignada = True
-                    break
-
-            if not asignada:
-                lineas.append({
-                    "y0": y0,
-                    "y1": y1,
-                    "words": [w]
-                })
-
-        for linea in lineas:
-            linea["words"] = sorted(linea["words"], key=lambda w: w[0])
-            linea["texto"] = " ".join(w[4] for w in linea["words"])
-            linea["x0"] = min(w[0] for w in linea["words"])
-            linea["x1"] = max(w[2] for w in linea["words"])
-
-        lineas = sorted(lineas, key=lambda l: l["y0"])
 
         monto_normalizado = normalizar_monto_texto(monto_busqueda)
 
         indice_base = None
         for i, linea in enumerate(lineas):
-            texto_normalizado = normalizar_monto_texto(linea["texto"])
-            if monto_normalizado in texto_normalizado:
+            if monto_normalizado in normalizar_monto_texto(linea["texto"]):
                 indice_base = i
                 break
 
@@ -226,15 +291,13 @@ def generar_recorte_monto(pdf_bytes, numero_pagina, monto_busqueda, zoom=3.0):
                 min(pagina.rect.width, rect.x1 + 40),
                 min(pagina.rect.height, rect.y1 + 3),
             )
-            matriz = fitz.Matrix(zoom, zoom)
-            pix = pagina.get_pixmap(matrix=matriz, clip=clip, alpha=False)
+            pix = pagina.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
             return pix.tobytes("png")
 
         linea_base = lineas[indice_base]
 
         inicio_x = 20
         fin_x = min(pagina.rect.width, linea_base["x1"] + 120)
-
         y_inicio = max(0, linea_base["y0"] - 3)
         y_fin = min(pagina.rect.height, linea_base["y1"] + 3)
 
@@ -257,9 +320,7 @@ def generar_recorte_monto(pdf_bytes, numero_pagina, monto_busqueda, zoom=3.0):
             fin_x = max(fin_x, min(pagina.rect.width, actual["x1"] + 40))
 
         clip = fitz.Rect(inicio_x, y_inicio, fin_x, y_fin)
-
-        matriz = fitz.Matrix(zoom, zoom)
-        pix = pagina.get_pixmap(matrix=matriz, clip=clip, alpha=False)
+        pix = pagina.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
 
         return pix.tobytes("png")
 
@@ -267,9 +328,9 @@ def generar_recorte_monto(pdf_bytes, numero_pagina, monto_busqueda, zoom=3.0):
         return None
 
 
-# ---------------------------
-# Extracción de candidatos para sumatoria
-# ---------------------------
+# =========================================================
+# Extracción de movimientos para sumatoria
+# =========================================================
 
 def extraer_movimientos_candidatos(pdf_bytes, nombre_archivo, objetivo):
     movimientos = []
@@ -279,41 +340,37 @@ def extraer_movimientos_candidatos(pdf_bytes, nombre_archivo, objetivo):
     except Exception:
         return movimientos
 
+    columnas_previas = None
+
     for num_pagina, pagina in enumerate(doc, start=1):
         if num_pagina == 1:
             continue
 
-        texto_pagina = pagina.get_text("text")
-        if not texto_pagina:
-            continue
-
-        lineas = texto_pagina.split("\n")
+        columnas_previas = detectar_columnas(pagina, columnas_previas)
+        lineas = obtener_lineas_desde_pagina(pagina)
 
         for i, linea in enumerate(lineas):
-            fecha = extraer_fecha(linea)
+            fecha = extraer_fecha(linea["texto"])
             if not fecha:
                 continue
 
             contexto = []
-
             if i > 0:
-                contexto.append(lineas[i - 1])
-            contexto.append(linea)
+                contexto.append(lineas[i - 1]["texto"])
+            contexto.append(linea["texto"])
             if i + 1 < len(lineas):
-                contexto.append(lineas[i + 1])
+                contexto.append(lineas[i + 1]["texto"])
 
             texto_contexto = " ".join(contexto)
 
-            # Excluir abonos
             if linea_es_abono(texto_contexto):
                 continue
 
-            montos = extraer_montos_de_linea(linea)
-            if not montos:
+            extraido = extraer_monto_columna_retiro(linea, columnas_previas)
+            if not extraido:
                 continue
 
-            # Tomar solo el último monto útil de la línea
-            monto = montos[-1]
+            monto, monto_texto = extraido
 
             if monto <= 0 or monto > objetivo:
                 continue
@@ -322,9 +379,10 @@ def extraer_movimientos_candidatos(pdf_bytes, nombre_archivo, objetivo):
                 "archivo": nombre_archivo,
                 "pagina": num_pagina,
                 "fecha": fecha,
-                "folio": extraer_folio(linea),
-                "linea": normalizar_texto(linea),
+                "folio": extraer_folio(linea["texto"]),
+                "linea": normalizar_texto(linea["texto"]),
                 "monto": monto,
+                "monto_texto": monto_texto,
                 "centavos": monto_a_centavos(monto),
             })
 
@@ -348,15 +406,11 @@ def extraer_movimientos_candidatos(pdf_bytes, nombre_archivo, objetivo):
     return unicos
 
 
-# ---------------------------
-# Subset sum por una sola fecha
-# ---------------------------
+# =========================================================
+# Sumatoria por un solo día
+# =========================================================
 
 def buscar_opciones_sumatoria_misma_fecha(movimientos, objetivo_centavos, max_opciones=20):
-    """
-    Devuelve varias opciones de sumatoria.
-    Cada opción usa movimientos de una sola fecha.
-    """
     grupos = defaultdict(list)
     for mov in movimientos:
         grupos[mov["fecha"]].append(mov)
@@ -414,9 +468,9 @@ def ordenar_opciones(opciones):
     )
 
 
-# ---------------------------
+# =========================================================
 # Render
-# ---------------------------
+# =========================================================
 
 def mostrar_resultados_exactos(resultados_totales, archivos_bytes, monto_busqueda):
     st.success(f"Se encontraron {len(resultados_totales)} coincidencia(s) exactas válidas.")
@@ -487,8 +541,15 @@ def mostrar_detalle_opcion(opcion, archivos_bytes):
         recorte = generar_recorte_monto(
             archivos_bytes[mov["archivo"]],
             mov["pagina"],
-            f"{mov['monto']:,.2f}"
+            mov["monto_texto"]
         )
+
+        if not recorte:
+            recorte = generar_recorte_monto(
+                archivos_bytes[mov["archivo"]],
+                mov["pagina"],
+                f"{mov['monto']:,.2f}"
+            )
 
         if not recorte:
             recorte = generar_recorte_monto(
@@ -507,9 +568,9 @@ def mostrar_detalle_opcion(opcion, archivos_bytes):
         st.divider()
 
 
-# ---------------------------
+# =========================================================
 # UI principal
-# ---------------------------
+# =========================================================
 
 uploaded_files = st.file_uploader(
     "Sube los PDFs",
@@ -553,7 +614,7 @@ if st.button("Buscar"):
         if exactos_validos:
             mostrar_resultados_exactos(exactos_validos, archivos_bytes, monto_busqueda.strip())
         else:
-            st.info("No se encontró monto exacto. Buscando opciones de sumatoria por un solo día...")
+            st.info("No se encontró monto exacto. Buscando opciones de sumatoria por un solo día usando solo la columna RETIRO...")
 
             todos_los_movimientos = []
 
@@ -564,6 +625,8 @@ if st.button("Buscar"):
                     objetivo=objetivo
                 )
                 todos_los_movimientos.extend(movimientos)
+
+            st.write(f"Movimientos candidatos detectados para sumatoria: {len(todos_los_movimientos)}")
 
             objetivo_centavos = monto_a_centavos(objetivo)
             opciones = buscar_opciones_sumatoria_misma_fecha(
