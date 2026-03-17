@@ -1,18 +1,17 @@
 import re
-from collections import defaultdict
 import fitz
 import streamlit as st
 
-# Configuración de página
+# Configuración inicial de la página
 st.set_page_config(page_title="Buscador de Montos Pro", layout="wide")
 st.title("🔍 Buscador de montos y sumas consecutivas")
 
 # =========================================================
-# 1. Utilidades de Procesamiento y Normalización
+# Funciones de Utilidad
 # =========================================================
 
 def normalizar_texto(texto):
-    return " ".join(texto.split())
+    return " ".join(texto.split()) if texto else ""
 
 def convertir_monto(texto):
     if not texto: return None
@@ -28,99 +27,64 @@ def monto_a_centavos(monto):
     return int(round(monto * 100))
 
 def extraer_fecha(linea):
+    # Busca formato DD-MMM-AAAA (ej. 15-MAR-2024)
     m = re.search(r"\b\d{2}-[A-Z]{3}-\d{4}\b", linea.upper())
-    if m: return m.group(0)
-    return None
-
-def extraer_folio(linea):
-    m = re.search(r"\b\d{6,8}\b", linea)
-    return m.group(0) if m else "Sin folio"
-
-def es_token_monto(texto):
-    texto = texto.strip()
-    return re.fullmatch(r"\d{1,3}(?:,\d{3})*\.\d{2}", texto) is not None or \
-           re.fullmatch(r"\d+\.\d{2}", texto) is not None
+    return m.group(0) if m else None
 
 # =========================================================
-# 2. Análisis de Estructura de PDF (Columnas y Líneas)
+# Procesamiento de PDF y Renglones
 # =========================================================
 
-def obtener_lineas_detalladas(pagina, tolerancia_y=3):
-    """Extrae palabras y las agrupa en líneas basadas en su posición vertical."""
-    palabras = pagina.get_text("words")
-    if not palabras: return []
-    
-    # Ordenar por Y (arriba-abajo) y luego por X (izquierda-derecha)
-    palabras = sorted(palabras, key=lambda w: (round(w[1], 1), w[0]))
-    lineas = []
-
-    for w in palabras:
-        x0, y0, x1, y1, txt = w[:5]
-        asignada = False
-        for linea in lineas:
-            if abs(linea["y_ref"] - y0) <= tolerancia_y:
-                linea["words"].append(w)
-                asignada = True
-                break
-        if not asignada:
-            lineas.append({"y_ref": y0, "words": [w], "y0": y0, "y1": y1})
-
-    for linea in lineas:
-        linea["words"].sort(key=lambda w: w[0])
-        linea["texto"] = " ".join(w[4] for w in linea["words"])
-        linea["x0"] = min(w[0] for w in linea["words"])
-        linea["x1"] = max(w[2] for w in linea["words"])
-        linea["y1"] = max(w[3] for w in linea["words"])
-        
-    return lineas
-
-def detectar_columna_retiro(pagina):
-    """Detecta el área X donde suelen estar los cargos/retiros."""
-    palabras = pagina.get_text("words")
-    x_retiro = None
-    for w in palabras:
-        if w[4].upper() in ["RETIRO", "EGRESO", "CARGO"]:
-            x_retiro = (w[0], w[2])
-            break
-    return x_retiro
-
-# =========================================================
-# 3. Lógica de Extracción y Búsqueda Consecutiva
-# =========================================================
-
-def extraer_movimientos_limpios(pdf_bytes, nombre_archivo):
-    """Analiza el PDF y devuelve una lista plana de movimientos con valor numérico."""
+def extraer_movimientos_pdf(pdf_bytes, nombre_archivo):
+    """Extrae renglones del PDF manteniendo el orden visual y detectando montos."""
     movimientos = []
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except: return []
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            for num_pag, pagina in enumerate(doc, start=1):
+                # Extraer palabras agrupadas en bloques de texto
+                bloques = pagina.get_text("dict")["blocks"]
+                
+                lineas_temp = []
+                for b in bloques:
+                    if "lines" in b:
+                        for l in b["lines"]:
+                            # Unir spans de texto en una sola línea
+                            texto_linea = "".join([s["text"] for s in l["spans"]])
+                            bbox = l["bbox"] # (x0, y0, x1, y1)
+                            lineas_temp.append({
+                                "y0": bbox[1],
+                                "y1": bbox[3],
+                                "x0": bbox[0],
+                                "x1": bbox[2],
+                                "texto": texto_linea,
+                                "pagina": num_pag
+                            })
+                
+                # Ordenar líneas de la página por su posición vertical (Y)
+                lineas_temp.sort(key=lambda x: x["y0"])
 
-    for num_pag, pagina in enumerate(doc, start=1):
-        x_limite = detectar_columna_retiro(pagina)
-        lineas = obtener_lineas_detalladas(pagina)
-        
-        for linea in lineas:
-            # Buscamos números con formato decimal
-            hallazgos = re.findall(r"(\d{1,3}(?:,\d{3})*\.\d{2})", linea["texto"])
-            for h in hallazgos:
-                valor = convertir_monto(h)
-                if valor and valor > 0:
-                    movimientos.append({
-                        "archivo": nombre_archivo,
-                        "pagina": num_pag,
-                        "texto": normalizar_texto(linea["texto"]),
-                        "monto": valor,
-                        "monto_texto": h,
-                        "centavos": monto_a_centavos(valor),
-                        "bbox": (linea["x0"], linea["y0"], linea["x1"], linea["y1"]),
-                        "fecha": extraer_fecha(linea["texto"]) or f"Pág {num_pag}"
-                    })
+                for linea in lineas_temp:
+                    # Buscar patrones de montos financieros (ej: 1,234.50 o 1234.50)
+                    hallazgos = re.findall(r"(\d{1,3}(?:,\d{3})*\.\d{2})", linea["texto"])
+                    for h in hallazgos:
+                        valor = convertir_monto(h)
+                        if valor and valor > 0:
+                            movimientos.append({
+                                "archivo": nombre_archivo,
+                                "pagina": linea["pagina"],
+                                "texto": normalizar_texto(linea["texto"]),
+                                "monto": valor,
+                                "monto_texto": h,
+                                "centavos": monto_a_centavos(valor),
+                                "bbox": (linea["x0"], linea["y0"], linea["x1"], linea["y1"]),
+                                "fecha": extraer_fecha(linea["texto"]) or f"Pág {num_pag}"
+                            })
+    except Exception as e:
+        st.error(f"Error procesando {nombre_archivo}: {e}")
     return movimientos
 
-def buscar_combinaciones_consecutivas(movimientos, objetivo_centavos):
-    """
-    Algoritmo de Ventana Deslizante: busca si el renglón N + N+1 + ... suma el objetivo.
-    """
+def buscar_secuencias_consecutivas(movimientos, objetivo_centavos):
+    """Busca renglones seguidos que sumen exactamente el monto deseado."""
     resultados = []
     n = len(movimientos)
     
@@ -128,7 +92,7 @@ def buscar_combinaciones_consecutivas(movimientos, objetivo_centavos):
         suma_actual = 0
         secuencia = []
         for j in range(i, n):
-            # No sumar movimientos de archivos distintos
+            # No permitir sumas entre archivos distintos
             if movimientos[j]["archivo"] != movimientos[i]["archivo"]: break
             
             suma_actual += movimientos[j]["centavos"]
@@ -147,75 +111,67 @@ def buscar_combinaciones_consecutivas(movimientos, objetivo_centavos):
     return resultados
 
 # =========================================================
-# 4. Visualización y Recortes
+# Recorte Visual
 # =========================================================
 
-def generar_recorte_multiple(pdf_bytes, lista_movs, zoom=3.0):
-    """Crea una imagen que abarca todos los renglones de una combinación."""
+def obtener_recorte_evidencia(pdf_bytes, lista_movs, zoom=2.0):
+    """Genera una imagen del área del PDF donde están los renglones encontrados."""
     try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        # Asumimos que la secuencia consecutiva está en la misma página o páginas cercanas
-        # Para simplificar, recortamos el área de la página del primer movimiento
-        m1 = lista_movs[0]
-        pag_idx = m1["pagina"] - 1
-        pagina = doc[pag_idx]
-        
-        # Determinar el área que cubre toda la secuencia
-        y_min = min(m["bbox"][1] for m in lista_movs) - 5
-        y_max = max(m["bbox"][3] for m in lista_movs) + 5
-        
-        clip = fitz.Rect(0, y_min, pagina.rect.width, y_max)
-        pix = pagina.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip)
-        return pix.tobytes("png")
-    except: return None
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            m1 = lista_movs[0]
+            pagina = doc[m1["pagina"] - 1]
+            
+            # Definir el rectángulo que abarca todos los movimientos de la secuencia
+            y_min = min(m["bbox"][1] for m in lista_movs) - 10
+            y_max = max(m["bbox"][3] for m in lista_movs) + 10
+            
+            # Rectángulo (x0, y0, x1, y1) usando el ancho completo de la página
+            rect = fitz.Rect(0, y_min, pagina.rect.width, y_max)
+            pix = pagina.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=rect)
+            return pix.tobytes("png")
+    except:
+        return None
 
 # =========================================================
-# 5. Interfaz Principal (Streamlit)
+# Interfaz de Usuario
 # =========================================================
 
-col_main, _ = st.columns([4, 1])
-with col_main:
-    uploaded_files = st.file_uploader("Sube tus estados de cuenta (PDF)", type=["pdf"], accept_multiple_files=True)
-    monto_str = st.text_input("Monto a buscar o sumar", placeholder="Ej: 1540.50")
+archivos = st.file_uploader("Sube tus estados de cuenta (PDF)", type=["pdf"], accept_multiple_files=True)
+monto_objetivo_str = st.text_input("Monto total a buscar", placeholder="Ej: 12500.00")
 
-if st.button("🚀 Iniciar Búsqueda Inteligente"):
-    if not uploaded_files or not monto_str:
-        st.error("Por favor, sube archivos y especifica un monto.")
+if st.button("Analizar Renglones"):
+    if not archivos or not monto_objetivo_str:
+        st.warning("Faltan archivos o el monto de búsqueda.")
     else:
-        objetivo = convertir_monto(monto_str)
-        if not objetivo:
-            st.error("Monto no válido. Usa el formato 0000.00")
+        monto_obj = convertir_monto(monto_objetivo_str)
+        if not monto_obj:
+            st.error("Monto inválido. Usa formato decimal (100.00)")
         else:
-            obj_cts = monto_a_centavos(objetivo)
-            archivos_data = {}
-            todos_movs = []
-            
-            with st.spinner("Analizando renglones consecutivamente..."):
-                for f in uploaded_files:
-                    f_bytes = f.read()
-                    archivos_data[f.name] = f_bytes
-                    todos_movs.extend(extraer_movimientos_limpios(f_bytes, f.name))
-            
-            resultados = buscar_combinaciones_consecutivas(todos_movs, obj_cts)
-            
-            if not resultados:
-                st.warning("No se encontró el monto exacto ni combinaciones consecutivas.")
-            else:
-                st.success(f"Se encontraron {len(resultados)} posibles coincidencias.")
-                
-                for idx, res in enumerate(resultados):
-                    tipo = "MONTO EXACTO" if res["es_exacto"] else f"SUMA DE {len(res['movimientos'])} RENGLONES"
-                    with st.expander(f"📍 {tipo} en {res['archivo']} (Total: ${res['total']:,.2f})"):
-                        
-                        # Mostrar detalle de texto
-                        for m in res["movimientos"]:
-                            st.caption(f"Página {m['pagina']} | {m['fecha']}")
-                            st.write(f"➡️ `{m['texto']}`")
-                        
-                        # Mostrar imagen del bloque
-                        recorte = generar_recorte_multiple(archivos_data[res['archivo']], res["movimientos"])
-                        if recorte:
-                            st.image(recorte, caption="Evidencia visual del documento", use_container_width=False)
-                        st.divider()
+            obj_cts = monto_a_centavos(monto_obj)
+            todos_los_datos = []
+            archivos_cache = {}
 
-st.info("Nota: Esta herramienta busca renglones que aparecen uno seguido de otro para garantizar la validez contable.")
+            with st.spinner("Leyendo y ordenando renglones del PDF..."):
+                for f in archivos:
+                    contenido = f.read()
+                    archivos_cache[f.name] = contenido
+                    todos_los_datos.extend(extraer_movimientos_pdf(contenido, f.name))
+
+            resultados = buscar_secuencias_consecutivas(todos_los_datos, obj_cts)
+
+            if not resultados:
+                st.info("No se encontraron coincidencias exactas ni consecutivas.")
+            else:
+                st.success(f"Se encontraron {len(resultados)} resultados.")
+                for idx, res in enumerate(resultados):
+                    etiqueta = "🎯 MONTO EXACTO" if res["es_exacto"] else f"🔗 SUMA DE {len(res['movimientos'])} RENGLONES"
+                    with st.expander(f"{etiqueta} | {res['archivo']} | ${res['total']:,.2f}"):
+                        
+                        # Lista de textos
+                        for m in res["movimientos"]:
+                            st.write(f"• **Pág {m['pagina']}**: `{m['texto']}`")
+                        
+                        # Evidencia visual
+                        img = obtener_recorte_evidencia(archivos_cache[res['archivo']], res["movimientos"])
+                        if img:
+                            st.image(img, caption="Fragmento extraído del PDF")
