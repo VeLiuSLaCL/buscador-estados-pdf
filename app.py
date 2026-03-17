@@ -62,8 +62,10 @@ def linea_es_abono(texto):
 
 def es_token_monto(texto):
     texto = texto.strip()
-    return re.fullmatch(r"\d{1,3}(?:,\d{3})*\.\d{2}", texto) is not None or \
-           re.fullmatch(r"\d+\.\d{2}", texto) is not None
+    return (
+        re.fullmatch(r"\d{1,3}(?:,\d{3})*\.\d{2}", texto) is not None
+        or re.fullmatch(r"\d+\.\d{2}", texto) is not None
+    )
 
 
 # =========================================================
@@ -113,9 +115,8 @@ def obtener_lineas_desde_pagina(pagina, tolerancia_y=3):
 
 def detectar_columnas(pagina, columnas_previas=None):
     """
-    Intenta detectar las posiciones X de DEPOSITO / RETIRO / SALDO.
-    Devuelve un diccionario con límites para la columna RETIRO.
-    Si no encuentra encabezados en la página, usa las columnas previas.
+    Detecta las posiciones X de DEPOSITO / RETIRO / SALDO.
+    Usa columnas previas si en la página actual no encuentra encabezados.
     """
     palabras = pagina.get_text("words")
     if not palabras:
@@ -143,7 +144,6 @@ def detectar_columnas(pagina, columnas_previas=None):
 
     retiro_x0, retiro_x1 = headers["retiro"]
 
-    # límites de la columna RETIRO usando puntos medios
     if headers["deposito"] is not None:
         dep_x0, dep_x1 = headers["deposito"]
         limite_izq = (dep_x1 + retiro_x0) / 2
@@ -192,7 +192,6 @@ def extraer_monto_columna_retiro(linea, columnas):
     if not candidatos:
         return None
 
-    # Si hubiera más de uno, tomar el más a la derecha dentro de RETIRO
     candidatos.sort(key=lambda x: x[0], reverse=True)
     _, monto, txt = candidatos[0]
     return monto, txt
@@ -386,7 +385,6 @@ def extraer_movimientos_candidatos(pdf_bytes, nombre_archivo, objetivo):
                 "centavos": monto_a_centavos(monto),
             })
 
-    # quitar duplicados
     unicos = []
     vistos = set()
 
@@ -407,10 +405,15 @@ def extraer_movimientos_candidatos(pdf_bytes, nombre_archivo, objetivo):
 
 
 # =========================================================
-# Sumatoria por un solo día
+# Sumatoria por un solo día con límites de seguridad
 # =========================================================
 
-def buscar_opciones_sumatoria_misma_fecha(movimientos, objetivo_centavos, max_opciones=20):
+def buscar_opciones_sumatoria_misma_fecha(
+    movimientos,
+    objetivo_centavos,
+    max_opciones=20,
+    max_movs_por_fecha=60
+):
     grupos = defaultdict(list)
     for mov in movimientos:
         grupos[mov["fecha"]].append(mov)
@@ -418,7 +421,11 @@ def buscar_opciones_sumatoria_misma_fecha(movimientos, objetivo_centavos, max_op
     opciones = []
 
     for fecha, lista in grupos.items():
+        lista = [x for x in lista if x["centavos"] <= objetivo_centavos]
         lista = sorted(lista, key=lambda x: x["centavos"], reverse=True)
+
+        if len(lista) > max_movs_por_fecha:
+            continue
 
         dp = {0: []}
 
@@ -499,7 +506,7 @@ def mostrar_resultados_exactos(resultados_totales, archivos_bytes, monto_busqued
                 st.image(
                     recorte,
                     caption=f"Recorte visual de {resultado['archivo']} - página {resultado['pagina']}",
-                    use_container_width=False
+                    width="content"
                 )
 
             st.divider()
@@ -562,7 +569,7 @@ def mostrar_detalle_opcion(opcion, archivos_bytes):
             st.image(
                 recorte,
                 caption=f"Recorte visual de {mov['archivo']} - página {mov['pagina']}",
-                use_container_width=False
+                width="content"
             )
 
         st.divider()
@@ -628,11 +635,20 @@ if st.button("Buscar"):
 
             st.write(f"Movimientos candidatos detectados para sumatoria: {len(todos_los_movimientos)}")
 
+            resumen_fechas = defaultdict(int)
+            for mov in todos_los_movimientos:
+                resumen_fechas[(mov["archivo"], mov["fecha"])] += 1
+
+            st.write("Candidatos por archivo/fecha:")
+            for (archivo, fecha), cantidad in sorted(resumen_fechas.items()):
+                st.write(f"- {archivo} | {fecha} | {cantidad} movimiento(s)")
+
             objetivo_centavos = monto_a_centavos(objetivo)
             opciones = buscar_opciones_sumatoria_misma_fecha(
                 todos_los_movimientos,
                 objetivo_centavos,
-                max_opciones=20
+                max_opciones=20,
+                max_movs_por_fecha=60
             )
 
             if not opciones:
