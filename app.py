@@ -1,5 +1,4 @@
 import re
-from collections import defaultdict
 
 import fitz
 import streamlit as st
@@ -28,10 +27,6 @@ def convertir_monto(texto):
         return None
 
 
-def monto_a_centavos(monto):
-    return int(round(monto * 100))
-
-
 def extraer_fecha(linea):
     m = re.search(r"\b\d{2}-[A-Z]{3}-\d{4}\b", linea.upper())
     if m:
@@ -58,14 +53,6 @@ def linea_es_abono(texto):
     ]
 
     return any(re.search(patron, texto) for patron in patrones)
-
-
-def es_token_monto(texto):
-    texto = texto.strip()
-    return (
-        re.fullmatch(r"\d{1,3}(?:,\d{3})*\.\d{2}", texto) is not None
-        or re.fullmatch(r"\d+\.\d{2}", texto) is not None
-    )
 
 
 # =========================================================
@@ -110,94 +97,6 @@ def obtener_lineas_desde_pagina(pagina, tolerancia_y=3):
 
 
 # =========================================================
-# Detección de columnas
-# =========================================================
-
-def detectar_columnas(pagina, columnas_previas=None):
-    """
-    Detecta las posiciones X de DEPOSITO / RETIRO / SALDO.
-    Usa columnas previas si en la página actual no encuentra encabezados.
-    """
-    palabras = pagina.get_text("words")
-    if not palabras:
-        return columnas_previas
-
-    headers = {
-        "deposito": None,
-        "retiro": None,
-        "saldo": None
-    }
-
-    for w in palabras:
-        x0, y0, x1, y1, txt = w[:5]
-        t = txt.upper()
-
-        if headers["deposito"] is None and t in ("DEPOSITO", "DEPÓSITO"):
-            headers["deposito"] = (x0, x1)
-        elif headers["retiro"] is None and t == "RETIRO":
-            headers["retiro"] = (x0, x1)
-        elif headers["saldo"] is None and t == "SALDO":
-            headers["saldo"] = (x0, x1)
-
-    if headers["retiro"] is None:
-        return columnas_previas
-
-    retiro_x0, retiro_x1 = headers["retiro"]
-
-    if headers["deposito"] is not None:
-        dep_x0, dep_x1 = headers["deposito"]
-        limite_izq = (dep_x1 + retiro_x0) / 2
-    else:
-        limite_izq = retiro_x0 - 120
-
-    if headers["saldo"] is not None:
-        sal_x0, sal_x1 = headers["saldo"]
-        limite_der = (retiro_x1 + sal_x0) / 2
-    else:
-        limite_der = retiro_x1 + 120
-
-    return {
-        "retiro_izq": limite_izq,
-        "retiro_der": limite_der,
-        "deposito": headers["deposito"],
-        "retiro": headers["retiro"],
-        "saldo": headers["saldo"],
-    }
-
-
-def extraer_monto_columna_retiro(linea, columnas):
-    """
-    Toma solo el monto que caiga dentro del rango X de la columna RETIRO.
-    """
-    if not columnas:
-        return None
-
-    izq = columnas["retiro_izq"]
-    der = columnas["retiro_der"]
-
-    candidatos = []
-
-    for w in linea["words"]:
-        x0, y0, x1, y1, txt = w[:5]
-
-        if not es_token_monto(txt):
-            continue
-
-        centro_x = (x0 + x1) / 2
-        if izq <= centro_x <= der:
-            monto = convertir_monto(txt)
-            if monto is not None:
-                candidatos.append((x0, monto, txt))
-
-    if not candidatos:
-        return None
-
-    candidatos.sort(key=lambda x: x[0], reverse=True)
-    _, monto, txt = candidatos[0]
-    return monto, txt
-
-
-# =========================================================
 # Búsqueda exacta
 # =========================================================
 
@@ -239,6 +138,7 @@ def buscar_lineas_con_monto(pdf_bytes, nombre_archivo, monto_busqueda):
 
             texto_contexto = " ".join(contexto)
 
+            # Se excluyen líneas que parezcan abonos
             if linea_es_abono(texto_contexto):
                 continue
 
@@ -328,154 +228,6 @@ def generar_recorte_monto(pdf_bytes, numero_pagina, monto_busqueda, zoom=3.0):
 
 
 # =========================================================
-# Extracción de movimientos para sumatoria
-# =========================================================
-
-def extraer_movimientos_candidatos(pdf_bytes, nombre_archivo, objetivo):
-    movimientos = []
-
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception:
-        return movimientos
-
-    columnas_previas = None
-
-    for num_pagina, pagina in enumerate(doc, start=1):
-        if num_pagina == 1:
-            continue
-
-        columnas_previas = detectar_columnas(pagina, columnas_previas)
-        lineas = obtener_lineas_desde_pagina(pagina)
-
-        for i, linea in enumerate(lineas):
-            fecha = extraer_fecha(linea["texto"])
-            if not fecha:
-                continue
-
-            contexto = []
-            if i > 0:
-                contexto.append(lineas[i - 1]["texto"])
-            contexto.append(linea["texto"])
-            if i + 1 < len(lineas):
-                contexto.append(lineas[i + 1]["texto"])
-
-            texto_contexto = " ".join(contexto)
-
-            if linea_es_abono(texto_contexto):
-                continue
-
-            extraido = extraer_monto_columna_retiro(linea, columnas_previas)
-            if not extraido:
-                continue
-
-            monto, monto_texto = extraido
-
-            if monto <= 0 or monto > objetivo:
-                continue
-
-            movimientos.append({
-                "archivo": nombre_archivo,
-                "pagina": num_pagina,
-                "fecha": fecha,
-                "folio": extraer_folio(linea["texto"]),
-                "linea": normalizar_texto(linea["texto"]),
-                "monto": monto,
-                "monto_texto": monto_texto,
-                "centavos": monto_a_centavos(monto),
-            })
-
-    unicos = []
-    vistos = set()
-
-    for mov in movimientos:
-        clave = (
-            mov["archivo"],
-            mov["pagina"],
-            mov["fecha"],
-            mov["folio"],
-            mov["linea"],
-            mov["centavos"],
-        )
-        if clave not in vistos:
-            vistos.add(clave)
-            unicos.append(mov)
-
-    return unicos
-
-
-# =========================================================
-# Sumatoria por un solo día con límites de seguridad
-# =========================================================
-
-def buscar_opciones_sumatoria_misma_fecha(
-    movimientos,
-    objetivo_centavos,
-    max_opciones=20,
-    max_movs_por_fecha=60
-):
-    grupos = defaultdict(list)
-    for mov in movimientos:
-        grupos[mov["fecha"]].append(mov)
-
-    opciones = []
-
-    for fecha, lista in grupos.items():
-        lista = [x for x in lista if x["centavos"] <= objetivo_centavos]
-        lista = sorted(lista, key=lambda x: x["centavos"], reverse=True)
-
-        if len(lista) > max_movs_por_fecha:
-            continue
-
-        dp = {0: []}
-
-        for idx, mov in enumerate(lista):
-            valor = mov["centavos"]
-            sums_actuales = list(dp.keys())
-
-            for suma_actual in sums_actuales:
-                nueva_suma = suma_actual + valor
-
-                if nueva_suma > objetivo_centavos:
-                    continue
-
-                if nueva_suma in dp:
-                    continue
-
-                nueva_ruta = dp[suma_actual] + [idx]
-                dp[nueva_suma] = nueva_ruta
-
-                if nueva_suma == objetivo_centavos:
-                    combo = [lista[i] for i in nueva_ruta]
-                    opciones.append({
-                        "archivo": combo[0]["archivo"],
-                        "fecha": fecha,
-                        "movimientos": combo,
-                        "total": sum(x["monto"] for x in combo),
-                        "cantidad_movimientos": len(combo),
-                    })
-
-                    if len(opciones) >= max_opciones:
-                        return ordenar_opciones(opciones)
-
-        if len(opciones) >= max_opciones:
-            break
-
-    return ordenar_opciones(opciones)
-
-
-def ordenar_opciones(opciones):
-    return sorted(
-        opciones,
-        key=lambda x: (
-            x["cantidad_movimientos"],
-            x["archivo"],
-            x["fecha"],
-        )
-    )
-
-
-# =========================================================
 # Render
 # =========================================================
 
@@ -488,7 +240,7 @@ def mostrar_resultados_exactos(resultados_totales, archivos_bytes, monto_busqued
             continue
 
         with st.container():
-            st.markdown(f"### Coincidencia exacta #{i}")
+            st.markdown(f"### Coincidencia #{i}")
             st.write(f"**Archivo:** {resultado['archivo']}")
             st.write(f"**Página:** {resultado['pagina']}")
             if resultado.get("fecha"):
@@ -510,69 +262,6 @@ def mostrar_resultados_exactos(resultados_totales, archivos_bytes, monto_busqued
                 )
 
             st.divider()
-
-
-def mostrar_selector_opciones(opciones):
-    etiquetas = []
-    for i, op in enumerate(opciones, start=1):
-        etiquetas.append(
-            f"Opción {i} | Archivo: {op['archivo']} | Fecha: {op['fecha']} | "
-            f"Movimientos: {op['cantidad_movimientos']} | Total: {op['total']:,.2f}"
-        )
-
-    seleccion = st.selectbox(
-        "Selecciona una opción de sumatoria",
-        options=list(range(len(opciones))),
-        format_func=lambda idx: etiquetas[idx]
-    )
-    return seleccion
-
-
-def mostrar_detalle_opcion(opcion, archivos_bytes):
-    st.markdown("## Detalle de la opción seleccionada")
-    st.write(f"**Archivo:** {opcion['archivo']}")
-    st.write(f"**Fecha:** {opcion['fecha']}")
-    st.write(f"**Cantidad de movimientos:** {opcion['cantidad_movimientos']}")
-    st.write(f"**Suma total:** {opcion['total']:,.2f}")
-
-    st.divider()
-
-    for i, mov in enumerate(opcion["movimientos"], start=1):
-        st.markdown(f"### Movimiento #{i}")
-        st.write(f"**Monto:** {mov['monto']:,.2f}")
-        st.write(f"**Página:** {mov['pagina']}")
-        st.write(f"**Fecha:** {mov['fecha']}")
-        st.write(f"**Folio:** {mov['folio']}")
-        st.write(f"**Línea:** {mov['linea']}")
-
-        recorte = generar_recorte_monto(
-            archivos_bytes[mov["archivo"]],
-            mov["pagina"],
-            mov["monto_texto"]
-        )
-
-        if not recorte:
-            recorte = generar_recorte_monto(
-                archivos_bytes[mov["archivo"]],
-                mov["pagina"],
-                f"{mov['monto']:,.2f}"
-            )
-
-        if not recorte:
-            recorte = generar_recorte_monto(
-                archivos_bytes[mov["archivo"]],
-                mov["pagina"],
-                f"{mov['monto']:.2f}"
-            )
-
-        if recorte:
-            st.image(
-                recorte,
-                caption=f"Recorte visual de {mov['archivo']} - página {mov['pagina']}",
-                width="content"
-            )
-
-        st.divider()
 
 
 # =========================================================
@@ -617,43 +306,12 @@ if st.button("Buscar"):
                 resultados_exactos.extend(resultados)
 
         exactos_validos = [r for r in resultados_exactos if "error" not in r]
+        errores = [r for r in resultados_exactos if "error" in r]
+
+        for err in errores:
+            st.error(f"{err['archivo']}: {err['error']}")
 
         if exactos_validos:
             mostrar_resultados_exactos(exactos_validos, archivos_bytes, monto_busqueda.strip())
         else:
-            st.info("No se encontró monto exacto. Buscando opciones de sumatoria por un solo día usando solo la columna RETIRO...")
-
-            todos_los_movimientos = []
-
-            for nombre_archivo, pdf_bytes in archivos_bytes.items():
-                movimientos = extraer_movimientos_candidatos(
-                    pdf_bytes=pdf_bytes,
-                    nombre_archivo=nombre_archivo,
-                    objetivo=objetivo
-                )
-                todos_los_movimientos.extend(movimientos)
-
-            st.write(f"Movimientos candidatos detectados para sumatoria: {len(todos_los_movimientos)}")
-
-            resumen_fechas = defaultdict(int)
-            for mov in todos_los_movimientos:
-                resumen_fechas[(mov["archivo"], mov["fecha"])] += 1
-
-            st.write("Candidatos por archivo/fecha:")
-            for (archivo, fecha), cantidad in sorted(resumen_fechas.items()):
-                st.write(f"- {archivo} | {fecha} | {cantidad} movimiento(s)")
-
-            objetivo_centavos = monto_a_centavos(objetivo)
-            opciones = buscar_opciones_sumatoria_misma_fecha(
-                todos_los_movimientos,
-                objetivo_centavos,
-                max_opciones=20,
-                max_movs_por_fecha=60
-            )
-
-            if not opciones:
-                st.error("No se encontraron opciones de sumatoria válidas en un solo día.")
-            else:
-                st.success(f"Se encontraron {len(opciones)} opción(es) de sumatoria.")
-                idx = mostrar_selector_opciones(opciones)
-                mostrar_detalle_opcion(opciones[idx], archivos_bytes)
+            st.info("No se encontró ese monto exacto en los PDFs cargados.")
